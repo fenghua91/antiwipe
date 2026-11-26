@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>防格机卫士</title>
+<style>
+html,body{margin:0;height:100%;background:#0f1115;color:#e6e8ee;font:15px/1.6 -apple-system,'Segoe UI',Roboto,sans-serif}
+.wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;padding:24px;box-sizing:border-box;text-align:center}
+.hint{color:#8b93a7;font-size:13px;max-width:320px}
+a.btn{background:#2b6cb0;color:#fff;border-radius:10px;padding:10px 18px;text-decoration:none;font-size:15px}
+.spin{width:26px;height:26px;border:3px solid #2a3040;border-top-color:#7cc4ff;border-radius:50%;animation:r 1s linear infinite}
+@keyframes r{to{transform:rotate(360deg)}}
+</style></head>
+<body><div class="wrap">
+<div class="spin"></div>
+<div>正在连接卫士控制台…</div>
+<div class="hint" id="h">停在 127.0.0.1 本机服务上；如果 3 秒后仍无响应，点下面的按钮</div>
+<a class="btn" id="b" href="http://127.0.0.1:8099/">打开控制台</a>
+</div>
+<script src="token.js"></script>
+<script>
+(function(){
+  var tk = String(window.ANTIWIPE_TK || "").trim();
+  var url = "http://127.0.0.1:8099/" + (tk ? "?tk=" + encodeURIComponent(tk) : "");
+  document.getElementById("b").href = url;
+  setTimeout(function(){ location.replace(url); }, 120);
+})();
+</script>
+</body></html>
