@@ -8,7 +8,8 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 
 ## 下载
 
-- 最新版 v1.1：<https://github.com/fenghua91/antiwipe/releases/download/v1.1/antiwipe-v1.1.zip>（md5 `7f087e1a29011bc812152cefd58118ec`）
+- 最新 v1.2（含 stdin/管道预检）：<https://github.com/fenghua91/antiwipe/releases/download/v1.2/antiwipe-v1.2.zip>
+- v1.1：<https://github.com/fenghua91/antiwipe/releases/download/v1.1/antiwipe-v1.1.zip>（md5 `7f087e1a29011bc812152cefd58118ec`）
 - 初版 v1.0（无断电层）：<https://github.com/fenghua91/antiwipe/releases/download/v1.0/antiwipe-v1.0.zip>（md5 `c1da22051035c29ea0f50a462ca96505`）
 - 全部版本：<https://github.com/fenghua91/antiwipe/releases>
 
@@ -17,6 +18,7 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 | 能力 | 说明 |
 |---|---|
 | 执行即杀（静态预检） | `sh` 脚本一 exec 就先读内容，命中危险命令行立刻终止，第一条命令都跑不到 |
+| stdin / 管道预检（v1.2） | `sh < 脚本`、`cat 脚本 | sh` 这类 argv 里没有路径的执行方式：读 stdin 指向的文件、或顺管道写端/父进程命令行找回源文件再扫；base64 编码的载荷会先解码再匹配 |
 | 命令级拦截 | 内核 proc connector（exec 事件）+ 250ms `/proc` 轮询双通道，命令一出现就匹配 |
 | 脚本树终止 | 命中后连同子进程、包装 shell 一起杀，防止换 shell 继续跑 |
 | 块设备句柄监控 | 非系统进程持有 `/dev/block*` 可写句柄时直接杀（抓原生二进制擦除） |
@@ -107,6 +109,8 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 | `ADMIN_WHITELIST` | `com.android.*,...` | 设备管理器白名单，支持 `*` |
 | `PROTECT_SD` | 1 | 用户存储删除保护 |
 | `SCAN_SCRIPTS` | 1 | 脚本静态预检；设 0 则退回纯命令级拦截 |
+| `SCAN_STDIN` | 1 | stdin 预检开关：`sh < 文件` 等不把路径放 argv 的写法也检查 |
+| `STRICT_PIPE` | 0 | 管道来源查不回来（curl 管道、编码载荷已跑完）时直接拦；默认 0 只放行 |
 | `BLOCK_FD` | 1 | 块设备可写句柄监控 |
 | `BLOCK_FD_MS` | 100 | 块设备句柄扫描间隔（20–1000 ms），独立线程 |
 | `POWEROFF` | 0 | 零落盘断电层：命中可写块设备句柄后冻结→刷盘→强制关机 |
@@ -136,6 +140,9 @@ su -c 'sh /data/local/tmp/全杀模块.sh'      # 连杀 3 轮，看守卫能不
 - 伪格机 → 终端会话直接被终止，`/data/adb/antiwipe/events.log` 出现 `[拦截] ... 脚本预检: ...`
 - 对照 → 全部打印完，日志无新拦截
 - 全杀 → 守卫跑在随机路径，按模块目录杀不到；web 被杀后 5 秒内被拉回
+
+
+> **管道喂入的小脚本仍有竞态（v1.2 起）**：`cat tiny.sh | sh`、`base64 -w0 x | base64 -d | sh` 这类内容在管道里、argv 里没有路径，守卫只能顺管道写端去找源文件；写端几百字节就干完、几十毫秒内退场时大概率找不到，脚本正文因此漏检。**正文漏检不等于放行**：脚本里真正执行的写块设备命令、递归删数据命令、重启命令在 exec 那一刻仍会被命令级规则当场掐掉（已实测：base64 编码管道喂入的写块设备命令仍被判 BLOCK_WRITE 击杀）。想更严可把 `STRICT_PIPE=1`，代价是 `curl | sh` 这类来源不可读的安装脚本也会被拦。
 
 ## 已知限制（请务必阅读）
 
@@ -184,6 +191,7 @@ dist/           发布 zip
 - 冻结 → 刷盘 → 断电指令：约 450ms（刷盘占大头，期间进程是 STOP 状态写不了）
 
 ## 版本
+- **v1.2**：新增 stdin / 管道预检（`sh < 文件`、`cat 文件 | sh`、base64 解码链、父进程命令行回溯），新增 `SCAN_STDIN` / `STRICT_PIPE` 配置；命令级规则与块设备监控不变
 
 1.1（versionCode 2）：新增零落盘断电层（独立 100ms 扫描线程 + 冻结 + 刷盘 + 强制关机），断电层默认关闭
 1.0（versionCode 1）：首发

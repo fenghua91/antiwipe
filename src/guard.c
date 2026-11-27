@@ -54,6 +54,8 @@ static int auto_rm_admin = 1;
 static int popup_enabled = 1;
 static int protect_sd = 1;
 static int scan_scripts = 1;
+static int scan_stdin = 1;   // sh < file / cat file | sh 也做预检
+static int strict_pipe = 0;  // 管道源不可读时直接拦（默认只放行不拦）
 static char whitelist[1024] = "com.android.*,com.google.*,com.vivo.*,com.qualcomm.*,com.mediatek.*";
 static char selfpath[512];
 static time_t last_popup = 0;
@@ -109,6 +111,8 @@ static void load_config(void) {
         else if (!strcmp(k, "POPUP")) popup_enabled = atoi(v);
         else if (!strcmp(k, "PROTECT_SD")) protect_sd = atoi(v);
         else if (!strcmp(k, "SCAN_SCRIPTS")) scan_scripts = atoi(v);
+        else if (!strcmp(k, "SCAN_STDIN")) scan_stdin = atoi(v);
+        else if (!strcmp(k, "STRICT_PIPE")) strict_pipe = atoi(v);
         else if (!strcmp(k, "BLOCK_FD")) block_fd = atoi(v);
         else if (!strcmp(k, "BLOCK_FD_MS")) block_fd_ms = atoi(v);
         else if (!strcmp(k, "WEB_PORT")) web_port = atoi(v);
@@ -622,6 +626,298 @@ static void kill_hit(pid_t pid, const char *rule, const char *desc, const char *
     popup(rule, desc, pid);
 }
 
+
+// ---- stdin 预检：`sh < 脚本`、`cat 脚本 | sh`、`base64 -d | sh` 这类不把路径放在 argv 里的执行方式 ----
+static const char *scan_buf(pid_t pid, const char *buf, size_t got, char *dbuf, size_t dn) {
+    char line[1024];
+    size_t pos = 0;
+    while (pos < got) {
+        size_t e = pos;
+        while (e < got && buf[e] != '\n') e++;
+        size_t L = e - pos;
+        if (L >= sizeof(line)) L = sizeof(line) - 1;
+        memcpy(line, buf + pos, L); line[L] = 0;
+        while (L && (line[L-1] == '\r' || line[L-1] == ' ' || line[L-1] == '\t')) line[--L] = 0;
+        if (L > 0) {
+            char d2[120] = "";
+            const char *r = match_cmd(pid, line, d2, sizeof(d2));
+            if (r) { snprintf(dbuf, dn, "%s", d2[0] ? d2 : line); return r; }
+        }
+        pos = e + 1;
+    }
+    return NULL;
+}
+
+// 简易 base64 解码：对付 base64 -d | sh 这类把脚本文本变形的执行方式
+static int b64_decode(const char *in, size_t n, char *out, size_t cap, size_t *on) {
+    static const char tb[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    unsigned v = 0; int bits = 0; size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = in[i];
+        if (c == '=') break;
+        const char *q = strchr(tb, c);
+        if (!q) continue;
+        v = (v << 6) | (unsigned)(q - tb);
+        bits += 6;
+        if (bits >= 8) { bits -= 8; if (k < cap) out[k++] = (char)((v >> bits) & 0xFF); }
+    }
+    *on = k;
+    return 0;
+}
+
+static int file_looks_b64(const char *buf, size_t got) {
+    size_t n = got > 4096 ? 4096 : got;
+    if (n < 16) return 0;
+    size_t okc = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\n' || c == '\r') continue;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '+' || c == '/' || c == '=') { okc++; continue; }
+        return 0;
+    }
+    return okc > n / 2;
+}
+
+static const char *scan_path(pid_t pid, const char *path, char *dbuf, size_t dn, const char *why, int dec) {
+    struct stat st;
+    if (!path || path[0] != '/') return NULL;
+    if (!strncmp(path, "/data/adb/modules/antiwipe", 26) || !strncmp(path, "/data/adb/antiwipe", 19)) return NULL;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return NULL;
+    if (st.st_size > (1 << 20)) return NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char *buf = malloc((size_t)st.st_size + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)st.st_size, f);
+    fclose(f);
+    buf[got] = 0;
+    char inner[120] = "";
+    const char *r = scan_buf(pid, buf, got, inner, sizeof(inner));
+    if (!r && (dec || file_looks_b64(buf, got))) {
+        char *dec2 = malloc(got + 8);
+        if (dec2) {
+            size_t dn2 = 0;
+            b64_decode(buf, got, dec2, got, &dn2);
+            if (dn2 > 0) {
+                char inner2[120] = "";
+                const char *r2 = scan_buf(pid, dec2, dn2, inner2, sizeof(inner2));
+                if (r2) { snprintf(inner, sizeof(inner), "base64 解码: %s", inner2); r = r2; }
+            }
+            free(dec2);
+        }
+    }
+    free(buf);
+    if (r) snprintf(dbuf, dn, "%s: %s", why, inner);
+    return r;
+}
+
+static int proc_is_shell(pid_t pid, const char *cmd) {
+    static const char *names[] = {"sh", "bash", "mksh", "dash", "ash", NULL};
+    char p[64], exe[256] = "";
+    snprintf(p, sizeof(p), "/proc/%d/exe", pid);
+    ssize_t n = readlink(p, exe, sizeof(exe) - 1);
+    if (n > 0) { exe[n] = 0;
+        for (int i = 0; names[i]; i++) if (!strcmp(base(exe), names[i])) return 1; }
+    char tmp[128]; strncpy(tmp, cmd, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+    char *sp = strchr(tmp, ' '); if (sp) *sp = 0;
+    for (int i = 0; names[i]; i++) if (!strcmp(base(tmp), names[i])) return 1;
+    return 0;
+}
+
+static int proc_has_decoder(pid_t w) {
+    char cmd[512] = "";
+    read_cmdline(w, cmd, sizeof(cmd));
+    if (strstr(cmd, "base64") && (strstr(cmd, "-d") || strstr(cmd, "--decode"))) return 1;
+    if (strstr(cmd, "uudecode")) return 1;
+    if (strstr(cmd, "openssl") && strstr(cmd, "base64")) return 1;
+    return 0;
+}
+
+static pid_t pipe_writer(const char *tgt) {
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    pid_t found = -1;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        pid_t w = (pid_t)atoi(de->d_name);
+        if (w <= 1) continue;
+        char p[64], t[512];
+        snprintf(p, sizeof(p), "/proc/%d/fd/1", w);
+        ssize_t n = readlink(p, t, sizeof(t) - 1);
+        if (n <= 0) continue;
+        t[n] = 0;
+        if (!strcmp(t, tgt)) { found = w; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+// 沿管道链往上走：写端进程的参数 / 打开的 fd 里若指向普通文件，就读出来预检
+static const char *chain_scan(pid_t w, const char *pipe_tgt, int depth, char *dbuf, size_t dn, int dec) {
+    if (getenv("AW_DEBUG")) logline("[调试] chain pid=%d depth=%d dec=%d", w, depth, dec);
+    if (depth <= 0 || w <= 1 || w == getpid()) return NULL;
+    if (proc_has_decoder(w)) dec = 1;
+    char cmd[512] = "";
+    read_cmdline(w, cmd, sizeof(cmd));
+    char tmp[512]; strncpy(tmp, cmd, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+    char *save = NULL;
+    for (char *t = strtok_r(tmp, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
+        if (t[0] != '/') continue;
+        const char *r = scan_path(w, t, dbuf, dn, "管道源预检", dec);
+        if (r) return r;
+    }
+    char fdp[64], tgt[512];
+    int again = 0;
+    for (int fd = 0; fd < 24; fd++) {
+        if (fd == 1) continue;
+        snprintf(fdp, sizeof(fdp), "/proc/%d/fd/%d", w, fd);
+        ssize_t m = readlink(fdp, tgt, sizeof(tgt) - 1);
+        if (m <= 0) continue;
+        tgt[m] = 0;
+        if (!strncmp(tgt, "pipe:[", 6)) {
+            if (fd == 0) again = 1;
+            continue;
+        }
+        if (tgt[0] != '/') continue;
+        const char *r = scan_path(w, tgt, dbuf, dn, "管道源预检", dec);
+        if (r) return r;
+    }
+    if (again) {
+        pid_t up = pipe_writer(tgt[0] ? tgt : "");
+        (void)up;
+        char p0[64], t0[512];
+        snprintf(p0, sizeof(p0), "/proc/%d/fd/0", w);
+        ssize_t k = readlink(p0, t0, sizeof(t0) - 1);
+        if (k > 0) {
+            t0[k] = 0;
+            if (!strncmp(t0, "pipe:[", 6)) {
+                pid_t up2 = pipe_writer(t0);
+                if (up2 > 1) return chain_scan(up2, t0, depth - 1, dbuf, dn, dec);
+            }
+        }
+    }
+    (void)pipe_tgt;
+    return NULL;
+}
+
+// 写端是否已经 exec 完（cmdline 不再是外面的包装 shell）
+static int pipe_writer_ready(pid_t w) {
+    char exe[256] = "";
+    char p[64];
+    snprintf(p, sizeof(p), "/proc/%d/exe", w);
+    ssize_t n = readlink(p, exe, sizeof(exe) - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+    const char *b = base(exe);
+    return strcmp(b, "bash") && strcmp(b, "sh") && strcmp(b, "mksh");
+}
+
+// 管道写端可能一瞬就跑完：顺着父进程命令行找被喂进去的文件（cat f | sh 这类调用在父 shell 的 argv 里）
+static const char *ancestor_scan(pid_t pid, char *dbuf, size_t dn) {
+    pid_t cur = pid;
+    for (int depth = 0; depth < 4; depth++) {
+        pid_t pp = get_ppid(cur);
+        if (pp <= 1) break;
+        char cmd[1024] = "";
+        read_cmdline(pp, cmd, sizeof(cmd));
+        if (!cmd[0]) break;
+        int dec = strstr(cmd, "base64") != NULL;
+        char tmp[1024];
+        strncpy(tmp, cmd, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+        char *save = NULL;
+        for (char *t = strtok_r(tmp, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
+            if (t[0] != '/') continue;
+            const char *r = scan_path(pp, t, dbuf, dn, "父进程命令行预检", dec);
+            if (r) return r;
+        }
+        cur = pp;
+    }
+    return NULL;
+}
+
+static const char *precheck_stdin(pid_t pid, char *dbuf, size_t dn) {
+    if (!scan_stdin) return NULL;
+    char p[64], tgt[512];
+    snprintf(p, sizeof(p), "/proc/%d/fd/0", pid);
+    ssize_t n = readlink(p, tgt, sizeof(tgt) - 1);
+    if (n <= 0) return NULL;
+    tgt[n] = 0;
+    if (getenv("AW_DEBUG")) logline("[调试] stdin pid=%d fd0=%s", pid, tgt);
+    if (tgt[0] == '/') return scan_path(pid, tgt, dbuf, dn, "stdin 文件预检", 0);
+    if (strncmp(tgt, "pipe:[", 6)) return NULL;
+    pid_t w = pipe_writer(tgt);
+    if (getenv("AW_DEBUG")) logline("[调试] 管道写端 pid=%d -> %d", pid, w);
+    if (w > 1) {
+        const char *hit = chain_scan(w, tgt, 4, dbuf, dn, 0);
+        if (hit) return hit;
+        hit = ancestor_scan(pid, dbuf, dn);
+        if (hit) return hit;
+        if (strict_pipe) {
+            char wcmd[220] = "";
+            read_cmdline(w, wcmd, sizeof(wcmd));
+            snprintf(dbuf, dn, "管道输入不可预检: %s", wcmd);
+            return "STDIN_PIPE";
+        }
+    } else {
+        const char *hit = ancestor_scan(pid, dbuf, dn);
+        if (hit) return hit;
+        if (strict_pipe) {
+            snprintf(dbuf, dn, "管道来源已退出，无法预检");
+            return "STDIN_PIPE";
+        }
+    }
+    return NULL;
+}
+
+// 管道场景写端可能还在 exec / 还没就位，放到独立线程里重试，别堵住 exec 事件通道
+static void *stdin_thread(void *arg) {
+    pid_t pid = *(pid_t *)arg;
+    free(arg);
+    char dbuf[160] = "";
+    for (int a = 0; a < 8; a++) {
+        const char *r = precheck_stdin(pid, dbuf, sizeof(dbuf));
+        if (r) {
+            char cmd[512] = "";
+            read_cmdline(pid, cmd, sizeof(cmd));
+            kill_hit(pid, r, dbuf, cmd);
+            return NULL;
+        }
+        usleep(8000);
+    }
+    return NULL;
+}
+
+static const char *stdin_is_pipe(pid_t pid) {
+    char p[64], tgt[512];
+    snprintf(p, sizeof(p), "/proc/%d/fd/0", pid);
+    ssize_t n = readlink(p, tgt, sizeof(tgt) - 1);
+    if (n <= 0) return NULL;
+    tgt[n] = 0;
+    if (strncmp(tgt, "pipe:[", 6)) return NULL;
+    return "pipe";
+}
+
+static const char *check_proc(pid_t pid, const char *cmd, char *dbuf, size_t dn) {
+    const char *rule = match_cmd(pid, cmd, dbuf, dn);
+    if (rule) return rule;
+    rule = precheck_script(pid, cmd, dbuf, dn);
+    if (rule) return rule;
+    if (!proc_is_shell(pid, cmd)) return NULL;
+    if (stdin_is_pipe(pid)) {
+        pid_t *pp = malloc(sizeof(pid_t));
+        if (pp) {
+            *pp = pid;
+            pthread_t t;
+            if (pthread_create(&t, NULL, stdin_thread, pp) == 0) pthread_detach(t);
+            else free(pp);
+        }
+        return NULL;
+    }
+    return precheck_stdin(pid, dbuf, dn);
+}
+
 // ---- 内核 exec 事件通道：进程一 exec 就检查，毫秒级 ----
 #define NETLINK_CONNECTOR 11
 #define CN_IDX_PROC 1
@@ -642,11 +938,8 @@ static void handle_exec(pid_t pid) {
     if (!cmd[0]) return;
     if (strstr(cmd, "/antiwipe/bin/guard")) return;
     char dbuf[160] = "";
-    const char *rule = match_cmd(pid, cmd, dbuf, sizeof(dbuf));
-    if (!rule) {
-        rule = precheck_script(pid, cmd, dbuf, sizeof(dbuf));
-        if (!rule) return;
-    }
+    const char *rule = check_proc(pid, cmd, dbuf, sizeof(dbuf));
+    if (!rule) return;
     kill_hit(pid, rule, dbuf, cmd);
 }
 
@@ -766,11 +1059,8 @@ static void scan_proc(void) {
         for (size_t i = 0; i < n; i++) if (cmd[i] == 0 || cmd[i] == '\n' || cmd[i] == '\r') cmd[i] = ' ';
         if (strstr(cmd, "/antiwipe/bin/guard")) continue;
         char dbuf[160] = "";
-        const char *rule = match_cmd(pid, cmd, dbuf, sizeof(dbuf));
-        if (!rule) {
-            rule = precheck_script(pid, cmd, dbuf, sizeof(dbuf));
-            if (!rule) continue;
-        }
+        const char *rule = check_proc(pid, cmd, dbuf, sizeof(dbuf));
+        if (!rule) continue;
         kill_hit(pid, rule, dbuf, cmd);
     }
     closedir(d);
