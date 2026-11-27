@@ -72,7 +72,7 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 
 ### 为什么是用户态，而不是 KPM / 内核钩子
 
-参考实现（失序 awblock）走 KPatch-Next，在 `blkdev_write_iter`、`blkdev_common_ioctl` 上直接拒绝写入——**零窗口**，理论上更硬。代价是依赖 KPatch-Next 内核补丁（`kpatch hello` 需返回 `hello2026`），本机内核 `6.6.127-android15-8-g24b70dd1cb81` 没有该模块，装了也不生效。
+参考实现（失序 awblock）走 KPatch-Next，在 `blkdev_write_iter`、`blkdev_common_ioctl` 上直接拒绝写入——**零窗口**，理论上更硬。代价是依赖 KPatch-Next 内核补丁（`kpatch hello` 需返回 `hello2026`），测试机内核 `6.6.127-android15-8-g24b70dd1cb81` 没有该模块，装了也不生效。
 
 本模块的选择是：**不碰分区、不碰内核**，用「多通道采集 + 快速冻结 + 断电兜底」逼近同样的效果：
 
@@ -196,7 +196,7 @@ dist/           发布 zip
 # 2) 确认演练正常后，POWEROFF_DRYRUN=0 再测一次真实断电（手机直接关机，别慌）
 ```
 
-实测（本机，Android 15 / 6.6.127 内核）：
+实测（Android 15 / 6.6.127 内核）：
 
 - 可写句柄 `open()` → SIGSTOP 冻结：49 / 63 / 66 / 75 / 88 ms
 - 只读句柄：不误杀，进程正常跑完 4 秒
