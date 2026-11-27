@@ -28,9 +28,60 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 | sysrq 加固 | 定时把 `/proc/sys/kernel/sysrq` 写回 0，挡住 `echo b > sysrq-trigger` 强重启 |
 | 设备管理器监控 | 新增设备管理器自动移除（白名单可配） |
 
+## 架构
+
+一句话：**没有内核钩子，全部在用户态做「采集 → 判定 → 处置」**，用多通道采集把检测窗口压到几十毫秒，再用「断电兜底」把最后那点落盘窗口抹掉。
+
+```
+                  采集层                                  判定层                 处置层
+  ┌────────────────────────────────────────┐
+  │ 1. proc connector（NETLINK_CONNECTOR）  │──┐
+  │    内核 exec 事件，命令一 exec 就推送    │  │
+  │ 2. /proc 轮询（POLL_MS=250）            │  │      match_cmd()
+  │    兜住 connector 漏掉/被屏蔽的进程      │──┼──►  14 条规则匹配  ──┬──► 杀进程树（父+子+包装 shell）
+  │ 3. 脚本预检（SCAN_SCRIPTS=1）           │  │      SYS_REQ/PANIC/   │     + 弹窗 + events.log
+  │    sh/bash <path> 先读脚本文本再放行     │  │      RM_RF/BLOCK_FD…  │
+  │ 4. 块设备句柄扫描（fd_loop，100ms）      │──┘                      └──► 可写 /dev/block 句柄？
+  │    扫 /proc/*/fd + fdinfo 写标志         │                             → SIGSTOP → sync → 断电
+  └────────────────────────────────────────┘
+```
+
+### 三层职责
+
+| 层 | 做什么 | 关键实现 |
+|---|---|---|
+| 采集层 | 拿「谁在 exec、谁开着块设备」 | proc connector 主通道 + 250ms `/proc` 轮询兜底 + 脚本预检提前读内容 + 独立线程 100ms 扫 fd |
+| 判定层 | 把命令行/路径/句柄归一成可控字符串再匹配 | `match_cmd()` 按规则表逐条匹配，路径先做 `..`／引号／空白归一；`exe_trusted()` 白名单放行系统与模块自身 |
+| 处置层 | 终止与兜底 | 命中 exec 类规则 → 杀整棵进程树并弹窗；命中 `BLOCK_FD` → SIGSTOP 冻结后按 `POWEROFF` 配置刷盘断电 |
+
+### 进程模型
+
+```
+/data/adb/antiwipe/run/.g<随机串>        ← 主机（main），监听 + 轮询 + 规则匹配
+        ├── keeper                        ← 看护主机，主机死则拉起
+        └── watchdog                      ← 看护 keeper，双杀 2–4 秒自愈
+```
+
+- 三者互相 `waitpid` + 心跳，忽略 `TERM/INT/HUP/QUIT/TSTP`，只认 `SIGKILL`
+- 二进制跑在随机文件名下（`.g<19 位随机>`），按模块目录名写死的杀进程脚本抓不到
+- 配置、日志、令牌都在 `/data/adb/antiwipe/`，与模块目录分离，升级模块不丢配置
+
+### 为什么是用户态，而不是 KPM / 内核钩子
+
+参考实现（失序 awblock）走 KPatch-Next，在 `blkdev_write_iter`、`blkdev_common_ioctl` 上直接拒绝写入——**零窗口**，理论上更硬。代价是依赖 KPatch-Next 内核补丁（`kpatch hello` 需返回 `hello2026`），本机内核 `6.6.127-android15-8-g24b70dd1cb81` 没有该模块，装了也不生效。
+
+本模块的选择是：**不碰分区、不碰内核**，用「多通道采集 + 快速冻结 + 断电兜底」逼近同样的效果：
+
+| 方案 | 拦截点 | 落盘窗口 | 依赖 |
+|---|---|---|---|
+| 失序 awblock（KPM） | 块设备写入口 | 0 | KPatch-Next 内核补丁 |
+| 本模块（用户态） | exec 前 / fd 持有期 | 50–90ms（实测 49–88ms），断电层再兜底 | 只要 root + KernelSU |
+
+窗口期的取舍写在「已知限制」里：`POWEROFF=1` 时窗口内的首次写入可能已经落盘，因此强制断电会丢未刷盘的 `/data` 数据——这是明确告知的代价，默认关闭。
+
 ## 安装
 
-1. 下载 `防格机卫士-v3.0.zip`
+1. 下载 `antiwipe-v1.1.zip`（见上方「下载」）
 2. 用 KernelSU / ReSukiSU 管理器「从本地安装」→ 重启
 3. 首次启动会安装弹窗组件 `com.dsh.antiwipe.alerts`（不需要可自行卸载，守卫仍会拦，只是没弹窗）
 
