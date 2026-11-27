@@ -18,15 +18,32 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
+#include <sys/reboot.h>
 
-#define MODDIR "/data/adb/antiwipe"
-#define CONF MODDIR "/config.conf"
+// 运行目录可用 AW_HOME 覆盖（用于测试，避免和正式实例抢锁）
+// 运行目录；AW_HOME 可覆盖（测试用，避免和正式实例抢锁）
+static char g_moddir_buf[256] = "/data/adb/antiwipe";
+static char g_conf_buf[300] = "/data/adb/antiwipe/config.conf";
+static char g_logf_buf[300] = "/data/adb/antiwipe/events.log";
+static char g_pidf_buf[300] = "/data/adb/antiwipe/guard.pid";
+static char g_lockf_buf[300] = "/data/adb/antiwipe/keeper.lock";
+static char g_lockw_buf[300] = "/data/adb/antiwipe/watchdog.lock";
+static char g_lockm_buf[300] = "/data/adb/antiwipe/guard.lock";
+static const char *g_moddir = g_moddir_buf;
+static const char *g_conf = g_conf_buf;
+static const char *g_logf = g_logf_buf;
+static const char *g_pidf = g_pidf_buf;
+static const char *g_lockf = g_lockf_buf;
+static const char *g_lockw = g_lockw_buf;
+static const char *g_lockm = g_lockm_buf;
+#define MODDIR ((char *)g_moddir)
+#define CONF g_conf
 #define CONF2 "/data/adb/modules/antiwipe/config.conf"
-#define LOGF MODDIR "/events.log"
-#define PIDF MODDIR "/guard.pid"
-#define LOCKF MODDIR "/keeper.lock"
-#define LOCKW MODDIR "/watchdog.lock"
-#define LOCKM MODDIR "/guard.lock"
+#define LOGF g_logf
+#define PIDF g_pidf
+#define LOCKF g_lockf
+#define LOCKW g_lockw
+#define LOCKM g_lockm
 #define ALERTPKG "com.dsh.antiwipe.alerts/.AlertActivity"
 #define LOGMAX (512 * 1024)
 #define PIDBITS (1 << 20)
@@ -43,7 +60,12 @@ static time_t last_popup = 0;
 static int is_keeper = 0;
 static int is_watch = 0;
 static int block_fd = 1;
+static int block_fd_ms = 100;
 static int web_port = 8099;
+static int poweroff_react = 0;   // POWEROFF=1 时才真的关断
+static int safe_uptime = 180;    // 开机这么久之后才认定“这是格机”
+static int poweroff_hold = 0;    // 只冻结不断电（调试）
+static int poweroff_dryrun = 0;  // 断电演练：走完整流程但不真的关机
 static unsigned long fdpass = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -60,7 +82,9 @@ static void logline(const char *fmt, ...) {
     fprintf(f, "\n"); fclose(f);
     struct stat st;
     if (stat(LOGF, &st) == 0 && st.st_size > LOGMAX) {
-        rename(LOGF, LOGF ".1");
+        char bak[360];
+        snprintf(bak, sizeof(bak), "%s.1", LOGF);
+        rename(LOGF, bak);
         f = fopen(LOGF, "w"); if (f) fclose(f);
     }
     pthread_mutex_unlock(&lock);
@@ -86,10 +110,17 @@ static void load_config(void) {
         else if (!strcmp(k, "PROTECT_SD")) protect_sd = atoi(v);
         else if (!strcmp(k, "SCAN_SCRIPTS")) scan_scripts = atoi(v);
         else if (!strcmp(k, "BLOCK_FD")) block_fd = atoi(v);
+        else if (!strcmp(k, "BLOCK_FD_MS")) block_fd_ms = atoi(v);
         else if (!strcmp(k, "WEB_PORT")) web_port = atoi(v);
+        else if (!strcmp(k, "POWEROFF")) poweroff_react = atoi(v);
+        else if (!strcmp(k, "POWEROFF_HOLD")) poweroff_hold = atoi(v);
+        else if (!strcmp(k, "POWEROFF_DRYRUN")) poweroff_dryrun = atoi(v);
+        else if (!strcmp(k, "SAFE_UPTIME")) safe_uptime = atoi(v);
         else if (!strcmp(k, "ADMIN_WHITELIST")) { strncpy(whitelist, v, sizeof(whitelist)-1); whitelist[sizeof(whitelist)-1] = 0; }
     }
     fclose(f);
+    if (block_fd_ms < 20) block_fd_ms = 20;
+    if (block_fd_ms > 1000) block_fd_ms = 1000;
     if (poll_ms < 50) poll_ms = 50;
     if (poll_ms > 2000) poll_ms = 2000;
 }
@@ -200,6 +231,101 @@ static int cwd_danger(pid_t pid) {
         "/data/system", NULL};
     for (int i = 0; ex[i]; i++) if (!strcmp(buf, ex[i])) return 1;
     return 0;
+}
+
+// ---- 断电反应层：块设备被写/丢块时，冻结进程 + 关页面缓存 + 强制断电 ----
+static time_t boot_time = 0;
+
+static unsigned long long proc_uptime(void) {
+    FILE *f = fopen("/proc/uptime", "r");
+    if (!f) return 0;
+    double up = 0;
+    if (fscanf(f, "%lf", &up) != 1) up = 0;
+    fclose(f);
+    return (unsigned long long)up;
+}
+
+// 关断前尽量把脏页刷下去，减少“断电导致丢数据”的代价
+static void sync_before_off(void) {
+    sync();
+    for (int i = 0; i < 200; i++) {
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (!f) break;
+        char line[128]; long dirty = 0, wb = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (!strncmp(line, "Dirty:", 6)) sscanf(line + 6, "%ld", &dirty);
+            else if (!strncmp(line, "Writeback:", 10)) sscanf(line + 10, "%ld", &wb);
+        }
+        fclose(f);
+        if (dirty <= 64 && wb <= 64) break;
+        usleep(10000);
+    }
+}
+
+static void do_poweroff(const char *why) {
+    if (poweroff_dryrun) {
+        logline("[断电演练] 命中 %s，真实场景会在此刷盘并强制关机（演练不执行）", why);
+        sync_before_off();
+        logline("[断电演练] 刷盘完成，退出演练");
+        return;
+    }
+    logline("[断电] 触发强制关机: %s", why);
+    sync_before_off();
+    unsigned long long up = proc_uptime();
+    // sysrq 在开机 60s 后才可用，且需要 /proc/sysrq-trigger 可写；不行就走 init 的 normal shutdown
+    const char *cmdline = (up > 60 && access("/proc/sysrq-trigger", W_OK) == 0)
+        ? "echo o > /proc/sysrq-trigger"
+        : "reboot -p";
+    pid_t c = fork();
+    if (c == 0) {
+        setsid();
+        execl("/system/bin/sh", "sh", "-c", cmdline, (char *)NULL);
+        _exit(1);
+    }
+    struct timespec ts = { 0, 600 * 1000 * 1000 };
+    nanosleep(&ts, NULL);   // 给 init 600ms 反应时间
+    // 兜底一：直接调 reboot(RB_POWER_OFF)，绕过 init 自己的策略
+    c = fork();
+    if (c == 0) {
+        setsid();
+        reboot(0x4321fedc);
+        _exit(1);
+    }
+    ts.tv_sec = 2; ts.tv_nsec = 0;
+    nanosleep(&ts, NULL);
+    // 兜底二：走 Android 的电源服务
+    c = fork();
+    if (c == 0) {
+        setsid();
+        execl("/system/bin/svc", "svc", "power", "shutdown", (char *)NULL);
+        _exit(1);
+    }
+    ts.tv_sec = 3; ts.tv_nsec = 0;
+    nanosleep(&ts, NULL);
+    logline("[断电] 关机命令未生效，继续拦截");
+}
+
+
+static void popup(const char *rule, const char *desc, pid_t pid);
+
+// 危险块写入的处理：先冻住，再决定关不关机
+static void react_block_write(pid_t pid, const char *desc, const char *cmd) {
+    (void)cmd;
+    if (pid > 1) kill(pid, SIGSTOP);
+    logline("[冻结] 已 SIGSTOP pid=%d (%s)", pid, desc);
+    unsigned long long up = boot_time ? (unsigned long long)(time(NULL) - boot_time) : proc_uptime();
+    if (poweroff_react) {
+        if (up < (unsigned long long)safe_uptime) {
+            logline("[跳过断电] 开机 %llus < %ds，判定为开机期正常操作，只杀进程", up, safe_uptime);
+        } else if (poweroff_hold) {
+            logline("[跳过断电] POWEROFF_HOLD=1，只冻结不断电");
+        } else {
+            popup("POWEROFF", desc, pid);
+            do_poweroff(desc);
+        }
+    }
+    if (kill_enabled) kill(pid, SIGKILL);
+    popup("BLOCK_FD", desc, pid);
 }
 
 static void popup(const char *rule, const char *desc, pid_t pid) {
@@ -669,14 +795,28 @@ static int fdinfo_writable(const char *p) {
     if (flags < 0) return -1;
     return (flags & 3) != 0;
 }
+// 立即处理刚发现的危险句柄：SIGSTOP 在毫秒级生效，比整轮扫描完再杀要早得多
+static void hit_block_fd(pid_t pid, const char *tgt, const char *fdn, const char *exe) {
+    char cmd[512] = "";
+    read_cmdline(pid, cmd, sizeof(cmd));
+    char desc[240];
+    snprintf(desc, sizeof(desc), "持有可写块设备句柄 %s (fd %s)", tgt, fdn);
+    logline("[发现] BLOCK_FD pid=%d exe=%s %s", pid, exe, desc);
+    react_block_write(pid, desc, cmd);
+    logline("[拦截] BLOCK_FD 进程已处理: %s | exe=%s", desc, exe);
+}
+
 static void scan_block_fds(void) {
     if (!block_fd) return;
+    int dbg = getenv("AW_DEBUG") != NULL;
+    int npid = 0, nfd = 0, nblk = 0, allpid = 0;
     DIR *d = opendir("/proc");
-    if (!d) return;
+    if (!d) { if (dbg) logline("[调试] opendir /proc 失败"); return; }
     struct dirent *e;
     char p[128], exe[512], tgt[512], fdp[160], fin[160];
     while ((e = readdir(d))) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        allpid++;
         pid_t pid = atoi(e->d_name);
         if (pid <= 1 || pid == getpid()) continue;
         snprintf(p, sizeof(p), "/proc/%d/exe", pid);
@@ -685,6 +825,8 @@ static void scan_block_fds(void) {
         exe[m] = 0;
         if (strstr(exe, "/antiwipe/bin/guard")) continue;
         if (exe_trusted(exe)) continue;
+        npid++;
+        if (dbg && npid <= 40) logline("[调试] 候选 exe=%s", exe);
         snprintf(p, sizeof(p), "/proc/%d/fd", pid);
         DIR *fd = opendir(p);
         if (!fd) continue;
@@ -695,21 +837,29 @@ static void scan_block_fds(void) {
             ssize_t k = readlink(fdp, tgt, sizeof(tgt)-1);
             if (k <= 0) continue;
             tgt[k] = 0;
+            nfd++;
             if (!blk_target(tgt)) continue;
+            nblk++;
             snprintf(fin, sizeof(fin), "/proc/%d/fdinfo/%s", pid, fe->d_name);
             if (fdinfo_writable(fin) != 1) continue;
-            char cmd[512] = "";
-            read_cmdline(pid, cmd, sizeof(cmd));
-            char desc[200];
-            snprintf(desc, sizeof(desc), "持有可写块设备句柄 %s (fd %s)", tgt, fe->d_name);
-            kill_hit(pid, "BLOCK_FD", desc, cmd);
-            logline("[拦截] BLOCK_FD 进程已杀: %s | exe=%s", desc, exe);
+            hit_block_fd(pid, tgt, fe->d_name, exe);
             hit = 1; break;
         }
         closedir(fd);
         if (hit) break;
     }
     closedir(d);
+    if (dbg) logline("[调试] 块句柄扫描: /proc可见pid=%d 候选=%d fd=%d 块设备fd=%d", allpid, npid, nfd, nblk);
+}
+
+// 独立的块设备句柄扫描线程：默认 100ms 一轮，比主循环快得多
+static void *fd_loop(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (block_fd) scan_block_fds();
+        usleep(block_fd_ms * 1000);
+    }
+    return NULL;
 }
 
 // ---- web 控制台看护：掉了就拉起来 ----
@@ -783,9 +933,13 @@ static void check_admins(void) {
 }
 
 static void lock_role(const char *path) {
+    int dbg = getenv("AW_DEBUG") != NULL;
     int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (dbg) logline("[调试] open 锁 %s fd=%d errno=%d", path, fd, fd < 0 ? errno : 0);
     if (fd < 0) return;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) _exit(0);   // 已有同角色在跑
+    int rc = flock(fd, LOCK_EX | LOCK_NB);
+    if (dbg) logline("[调试] flock rc=%d errno=%d", rc, rc ? errno : 0);
+    if (rc != 0) _exit(0);   // 已有同角色在跑
 }
 
 static void keeper_loop(void) {
@@ -809,6 +963,17 @@ static void watch_loop(void) {
 }
 
 int main(int argc, char **argv) {
+    const char *home = getenv("AW_HOME");
+    if (home && home[0] == '/') {
+        snprintf(g_moddir_buf, sizeof(g_moddir_buf), "%s", home);
+        mkdir(g_moddir_buf, 0755);
+        snprintf(g_conf_buf, sizeof(g_conf_buf), "%s/config.conf", home);
+        snprintf(g_logf_buf, sizeof(g_logf_buf), "%s/events.log", home);
+        snprintf(g_pidf_buf, sizeof(g_pidf_buf), "%s/guard.pid", home);
+        snprintf(g_lockf_buf, sizeof(g_lockf_buf), "%s/keeper.lock", home);
+        snprintf(g_lockw_buf, sizeof(g_lockw_buf), "%s/watchdog.lock", home);
+        snprintf(g_lockm_buf, sizeof(g_lockm_buf), "%s/guard.lock", home);
+    }
     snprintf(selfpath, sizeof(selfpath), "/proc/%d/exe", getpid());
     ssize_t n = readlink(selfpath, selfpath, sizeof(selfpath)-1);
     if (n > 0) selfpath[n] = 0;
@@ -831,22 +996,31 @@ int main(int argc, char **argv) {
     signal(SIGQUIT, SIG_IGN); signal(SIGPIPE, SIG_IGN);
     signal(SIGTSTP, SIG_IGN); signal(SIGTTIN, SIG_IGN); signal(SIGTTOU, SIG_IGN);
     mkdir(MODDIR, 0755);
-    mkdir(MODDIR "/log", 0755);
+    char logdir[320];
+    snprintf(logdir, sizeof(logdir), "%s/log", MODDIR);
+    mkdir(logdir, 0755);
     load_config();
     if (is_keeper) keeper_loop();
     if (is_watch) watch_loop();
+    if (getenv("AW_DEBUG")) logline("[调试] main 进入前台循环");
+    if (getenv("AW_DEBUG")) logline("[调试] 角色=main pid=%d", getpid());
+    if (getenv("AW_DEBUG")) logline("[调试] 准备拿主锁");
     lock_role(LOCKM);
+    if (getenv("AW_DEBUG")) logline("[调试] 拿到主锁 pid=%d", getpid());
     pthread_t nt;
     pthread_create(&nt, NULL, nl_loop, NULL);
+    pthread_t bt;
+    pthread_create(&bt, NULL, fd_loop, NULL);
     FILE *pf = fopen(PIDF, "w");
     if (pf) { fprintf(pf, "%d", getpid()); fclose(pf); }
-    logline("[启动] 防格机卫士 pid=%d poll=%dms kill=%d popup=%d protect_sd=%d", getpid(), poll_ms, kill_enabled, popup_enabled, protect_sd);
+    boot_time = time(NULL) - (long)proc_uptime();
+    logline("[启动] 防格机卫士 pid=%d poll=%dms kill=%d popup=%d protect_sd=%d block_fd=%d poweroff=%d",
+            getpid(), poll_ms, kill_enabled, popup_enabled, protect_sd, block_fd, poweroff_react);
     spawn_self("-k");   // 重复的会因 flock 自动退出
     spawn_self("-w");
     time_t last_path = 0, last_admin = 0, last_keep = 0;
     for (;;) {
         scan_proc();
-        if ((++fdpass & 1) == 0) scan_block_fds();
         time_t now = time(NULL);
         if (now - last_path >= 3) { check_paths(); last_path = now; }
         if (now - last_admin >= 60) { check_admins(); last_admin = now; }
