@@ -419,11 +419,12 @@ static const char *match_cmd(pid_t pid, const char *cmd, char *dbuf, size_t dn) 
             if (del && tgt) { snprintf(dbuf, dn, "find -delete %s", tgt); return "FIND_DEL"; }
         }
         if (is_tool(t, "mv")) {
+            // 只看源：把受保护目录（含所有子路径）里的东西搬走才是破坏，往 /data/adb 里搬是正常装模块
             for (int j = i + 1; j < nt; j++) {
                 if (is_sep(tok[j])) break;
-                if (!strcmp(tok[j], "/data") || !strcmp(tok[j], "/data/system") || !strcmp(tok[j], "/data/adb")) {
-                    snprintf(dbuf, dn, "移动 %s", tok[j]); return "MV_DATA";
-                }
+                if (tok[j][0] == '-') continue;
+                if (danger_target(tok[j])) { snprintf(dbuf, dn, "移动 %s", tok[j]); return "MV_DATA"; }
+                break;
             }
         }
         if (is_tool(t, "pm") && i + 2 < nt && !strcmp(tok[i+1], "clear")) {
