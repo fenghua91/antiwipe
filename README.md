@@ -6,6 +6,12 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 
 纯用户态实现，**不写任何分区**，不替换系统文件，只做监测与终止。
 
+## 下载
+
+- 最新版 v1.1：<https://github.com/fenghua91/antiwipe/releases/download/v1.1/antiwipe-v1.1.zip>（md5 `7f087e1a29011bc812152cefd58118ec`）
+- 初版 v1.0（无断电层）：<https://github.com/fenghua91/antiwipe/releases/download/v1.0/antiwipe-v1.0.zip>（md5 `c1da22051035c29ea0f50a462ca96505`）
+- 全部版本：<https://github.com/fenghua91/antiwipe/releases>
+
 ## 特性
 
 | 能力 | 说明 |
