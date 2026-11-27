@@ -128,6 +128,16 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 
 ## 验证
 
+### 一键自检（推荐先跑这个）
+
+```sh
+su -c "sh /storage/emulated/0/Download/antiwipe/test/自检.sh"
+```
+
+脚本把每个用例放在**孤儿进程**里执行（父进程立刻退出、被 init 收养），所以守卫「连坐脚本树」时不会把自检脚本一起杀掉。所有破坏性动作只指向它自建的探针（`/data/adb/aw_selftest_*`、`/dev/block/antiwipe_selftest0`），跑完自动清理，不碰真实数据。
+
+覆盖 9 项：服务存活 / 直接执行 / `sh < 文件` / `cat 文件 | sh`（竞态项会标 WARN）/ 写块设备 / 递归删 /data/adb/aw_selftest_子目录 / 搬走子目录 / `find -delete` / 正常脚本零误报。全部通过输出 `PASS=8 FAIL=0 WARN=1`。
+
 `test/` 里是自测工具，全部使用假路径/假程序，不会真破坏：
 
 ```sh
