@@ -33,4 +33,4 @@ write_token
 for p in /proc/[0-9]*; do
   [ "$(readlink "$p/exe" 2>/dev/null)" = "$MODDIR/bin/guard" ] && exit 0
 done
-"$MODDIR/bin/guard" >/dev/null 2>&1 &
+if command -v setsid >/dev/null 2>&1; then setsid "$MODDIR/bin/guard" >/dev/null 2>&1 </dev/null & else "$MODDIR/bin/guard" >/dev/null 2>&1 </dev/null & fi

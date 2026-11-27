@@ -1144,10 +1144,25 @@ static void scan_block_fds(void) {
 }
 
 // 独立的块设备句柄扫描线程：默认 100ms 一轮，比主循环快得多
+// 有人（安装脚本、清理工具、格机脚本）把 guard.pid 删掉时自愈，否则外部靠 pid 文件判活会误判"没在跑"
+static void ensure_pidfile(void) {
+    int fd = open(PIDF, O_RDONLY);
+    if (fd >= 0) {
+        char b[32] = "";
+        ssize_t n = read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (n > 0 && atoi(b) == (int)getpid()) return;
+    }
+    FILE *pf = fopen(PIDF, "w");
+    if (pf) { fprintf(pf, "%d", (int)getpid()); fclose(pf); }
+}
+
 static void *fd_loop(void *arg) {
     (void)arg;
+    int tick = 0;
     for (;;) {
         if (block_fd) scan_block_fds();
+        if (++tick % 50 == 0) ensure_pidfile();
         usleep(block_fd_ms * 1000);
     }
     return NULL;

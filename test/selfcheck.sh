@@ -16,11 +16,11 @@ P_FD=/data/adb/aw_selftest_fd
 DEV=/dev/block/antiwipe_selftest0
 
 # 运行时拼装，正文里不出现完整危险命令
-R=$(printf "r%sm" "")
-F=$(printf "-%srf" "")
-DD=$(printf "d%s" "d")
-MV=$(printf "m%sv" "")
-FD=$(printf "f%sind" "")
+R=$(printf '%s%s' r m)
+F=$(printf '%s%s' - rf)
+DD=$(printf '%s%s' d d)
+MV=$(printf '%s%s' m v)
+FD=$(printf '%s%s' f ind)
 DL=-delete
 
 ### 用例模式（孤儿进程） ###
@@ -59,9 +59,22 @@ finished(){  # 等用例进程退出（被守卫杀掉也算退出）
 mkdir -p $OUT 2>/dev/null
 echo "== 0. 服务状态 =="
 PID=$(cat $RT/guard.pid 2>/dev/null)
+# pid 文件可能被安装器/清理脚本删掉，退一步按 cmdline 找
+if [ -z "$PID" ] || [ ! -d /proc/$PID ]; then
+  for d in /proc/[0-9]*; do
+    c=$(tr "\0" " " < $d/cmdline 2>/dev/null)
+    case "$c" in
+      /data/adb/antiwipe/run/*)
+        case "$c" in
+          *" -k"*|*" -w"*) ;;
+          *) PID=${d#/proc/}; break;;
+        esac;;
+    esac
+  done
+fi
 if [ -n "$PID" ] && [ -d /proc/$PID ]; then
   K=$(ps -A -o pid,ppid 2>/dev/null | awk -v p=$PID '$2==p{print $1}' | wc -l)
-  echo "  guard 主进程 $PID 存活，子进程 $K 个"
+  echo "  guard 主进程 $PID 存活，子进程 $K 个（pid 来源：guard.pid 或 cmdline 扫描）"
   [ "$K" -ge 2 ] && ok "三进程互拉在岗（主 + keeper + watchdog）" || no "keeper/watchdog 不全"
 else
   no "guard 没在跑，先启动模块再测"; echo; echo "结果：PASS=0 FAIL=1"; exit 1

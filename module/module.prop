@@ -1,6 +1,6 @@
 id=antiwipe
 name=防格机卫士
-version=1.2.1
-versionCode=4
+version=1.2.2
+versionCode=5
 author=风花雪月
-description=防格机卫士 v1.2.1：脚本一执行即终止（静态预检）+ 命令级毫秒拦截 + 块设备可写句柄监控 + 脚本树终止 + sysrq 加固；用户存储保护（/sdcard 等子路径）；运行时随机路径；web 控制台掉线自动拉起；主/keeper/watchdog 三进程互拉；新增零落盘断电层（可写块设备句柄 open 后 50-90ms 冻结，刷盘后强制关机，默认关闭需手动开）。新增 stdin/管道预检（sh < 文件、cat 文件 | sh、base64 解码链）；MV_DATA 覆盖受保护目录的所有子路径；纯用户态监测，不写任何分区。
+description=防格机卫士 v1.2.2：脚本一执行即终止（静态预检）+ 命令级毫秒拦截 + 块设备可写句柄监控 + 脚本树终止 + sysrq 加固；用户存储保护（/sdcard 等子路径）；运行时随机路径；web 控制台掉线自动拉起；主/keeper/watchdog 三进程互拉；新增零落盘断电层（可写块设备句柄 open 后 50-90ms 冻结，刷盘后强制关机，默认关闭需手动开）。新增 stdin/管道预检（sh < 文件、cat 文件 | sh、base64 解码链）；guard.pid 被删后 5 秒内自愈；启动脚本改用 setsid；MV_DATA 覆盖子路径；纯用户态监测，不写任何分区。

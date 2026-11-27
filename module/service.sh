@@ -34,4 +34,9 @@ done
 rm -rf "$RUNDIR/run" 2>/dev/null
 mkdir -p "$RUNDIR/run"
 RUNBIN="$RUNDIR/run/.g$(date +%s)$$"
-cp -f "$MODDIR/bin/guard" "$RUNBIN" 2>/dev/null && chmod 755 "$RUNBIN" && "$RUNBIN" >/dev/null 2>&1 </dev/null &
+cp -f "$MODDIR/bin/guard" "$RUNBIN" 2>/dev/null && chmod 755 "$RUNBIN"
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$RUNBIN" >/dev/null 2>&1 </dev/null &
+else
+  "$RUNBIN" >/dev/null 2>&1 </dev/null &
+fi

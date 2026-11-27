@@ -8,7 +8,8 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 
 ## 下载
 
-- 最新 v1.2.1（stdin/管道预检 + MV 子路径）：<https://github.com/fenghua91/antiwipe/releases/download/v1.2.1/antiwipe-v1.2.1.zip>
+- 最新 v1.2.2：<https://github.com/fenghua91/antiwipe/releases/download/v1.2.2/antiwipe-v1.2.2.zip>
+- v1.2.1（stdin/管道预检 + MV 子路径）：<https://github.com/fenghua91/antiwipe/releases/download/v1.2.1/antiwipe-v1.2.1.zip>
 - v1.2：<https://github.com/fenghua91/antiwipe/releases/download/v1.2/antiwipe-v1.2.zip>
 - v1.1：<https://github.com/fenghua91/antiwipe/releases/download/v1.1/antiwipe-v1.1.zip>（md5 `7f087e1a29011bc812152cefd58118ec`）
 - 初版 v1.0（无断电层）：<https://github.com/fenghua91/antiwipe/releases/download/v1.0/antiwipe-v1.0.zip>（md5 `c1da22051035c29ea0f50a462ca96505`）
@@ -202,6 +203,7 @@ dist/           发布 zip
 - 冻结 → 刷盘 → 断电指令：约 450ms（刷盘占大头，期间进程是 STOP 状态写不了）
 
 ## 版本
+- **v1.2.2**：`guard.pid` 被安装器/清理脚本删掉后自动重建（否则外部看门狗和自检会误判"没在跑"）；`service.sh`/`post-fs-data.sh` 改用 `setsid` 启动，脚本退出不再带走主进程；自检脚本修 `printf` 以 `-` 开头格式串的崩溃、并在 pid 文件缺失时按 cmdline 找主进程
 - **v1.2.1**：`MV_DATA` 从「只认三个精确路径」改成「受保护目录的任意子路径」——把受保护目录里的内容 `mv ` 走现在会被拦（往 /data/adb 里搬仍放行，不影响装模块）
 - **v1.2**：新增 stdin / 管道预检（`sh < 文件`、`cat 文件 | sh`、base64 解码链、父进程命令行回溯），新增 `SCAN_STDIN` / `STRICT_PIPE` 配置；命令级规则与块设备监控不变
 
