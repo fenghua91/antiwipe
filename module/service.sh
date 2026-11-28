@@ -1,17 +1,17 @@
 #!/system/bin/sh
+# 防格机卫士 · 开机完成后补充启动
 MODDIR=${0%/*}
 RUNDIR=/data/adb/antiwipe
 until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 5; done
 mkdir -p "$RUNDIR/log"
 [ -f "$RUNDIR/config.conf" ] || cp -f "$MODDIR/config.conf" "$RUNDIR/config.conf" 2>/dev/null
-chmod 755 "$MODDIR/bin/guard" "$MODDIR/bin/web" 2>/dev/null
+chmod 755 "$MODDIR/bin/guard" 2>/dev/null
+chmod 755 "$MODDIR"/webroot/cgi-bin/api/*.sh 2>/dev/null
 
 write_token() {
   [ -f "$RUNDIR/web.token" ] || return 0
-  TK=$(cat "$RUNDIR/web.token" 2>/dev/null)
-  [ -n "$TK" ] || return 0
-  W="$MODDIR/webroot/token.js"
-  NEW="window.ANTIWIPE_TK=\"$TK\";"
+  TK=$(cat "$RUNDIR/web.token" 2>/dev/null); [ -n "$TK" ] || return 0
+  W="$MODDIR/webroot/token.js"; NEW="window.ANTIWIPE_TK=\"$TK\";"
   [ "$(cat "$W" 2>/dev/null)" = "$NEW" ] && return 0
   printf '%s\n' "$NEW" > "$W" 2>/dev/null
 }
@@ -21,16 +21,10 @@ if ! pm path com.dsh.antiwipe.alerts >/dev/null 2>&1; then
   pm install -r "$MODDIR/alerts.apk" >/dev/null 2>&1
 fi
 
-# 已在运行（模块目录或随机运行目录）就直接退出
 for p in /proc/[0-9]*; do
   e=$(readlink "$p/exe" 2>/dev/null)
-  case "$e" in
-    "$MODDIR"/bin/guard|"$RUNDIR"/run/*) exit 0;;
-  esac
+  case "$e" in "$MODDIR"/bin/guard|"$RUNDIR"/run/*) exit 0;; esac
 done
-
-# 运行时随机化：把二进制复制到 /data/adb/antiwipe/run/ 下的随机路径再启动，
-# 这样“按模块目录杀进程”的脚本抓不到正在跑的主进程。
 rm -rf "$RUNDIR/run" 2>/dev/null
 mkdir -p "$RUNDIR/run"
 RUNBIN="$RUNDIR/run/.g$(date +%s)$$"
