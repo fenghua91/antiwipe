@@ -123,7 +123,7 @@ KernelSU / ReSukiSU 模块：在格机（wipe / 强重启 / 删数据）脚本�
 
 ## 检测规则
 
-`SYS_REQ`（sysrq/内核请求）、`PANIC`、`WIPE_BCAST`、`REBOOT`、`RM_RF`（递归删危险目录）、`RM_CWD`、`FIND_DEL`、`MV_DATA`、`PM_CLEAR`、`BLOCK_WRITE`（dd/cp/cat 写块设备）、`MKFS`、`IPT_POLICY`、`SHRED`、`UMOUNT`、`BLOCK_FD`（持有可写块设备句柄）。
+`SYS_REQ`（sysrq/内核请求）、`PANIC`、`WIPE_BCAST`、`REBOOT`、`RM_RF`（递归删危险目录）、`RM_CWD`、`FIND_DEL`、`MV_DATA`、`PM_CLEAR`、`BLOCK_WRITE`（dd/cp/cat 写块设备）、`MKFS`、`IPT_POLICY`、`SHRED`、`UMOUNT`、`BLOCK_FD`（持有可写块设备句柄）、`SETENFORCE`（关 SELinux）、`USB_KILL`（关 USB/断 ADB）、`NET_DOWN`（网卡置 down）、`MOUNT_RW`（重挂系统分区可写，默认关）。
 
 危险目标：系统/数据/启动关键目录、块设备、sysrq、恢复出厂相关命令；用户存储按前缀判定。
 
@@ -203,6 +203,12 @@ dist/           发布 zip
 - 冻结 → 刷盘 → 断电指令：约 450ms（刷盘占大头，期间进程是 STOP 状态写不了）
 
 ## 版本
+- **v1.3.0**：
+  - 新增 4 条「救援通道」规则：`SETENFORCE`（`setenforce 0`）、`USB_KILL`（`setprop sys.usb.config none` / `svc usb` / 直写 `/sys/class/android_usb/*` / `/sys/bus/usb/devices/*`）、`NET_DOWN`（`ip link set … down`、`ifconfig … down`）、`MOUNT_RW`（`mount -o rw,remount /system`，默认关）。四条都按发起者 exe 判定，系统进程与 KSU/Magisk 自身放行，避免误杀。
+  - 脚本预检改流式扫描：去掉 1MB 上限（升到 64MB 且逐块读），自动跳过 NUL 填充块；实测 14MB 的「4KB 脚本 + 14MB 零字节」样本可正常判死。
+  - 相对路径不再绕过预检：`cd /sdcard/Download && sh 格机.sh` 现在会按 `/proc/<pid>/cwd` 解析后全文扫描（旧版直接放行）。
+  - 预检白名单从「`/data/adb/antiwipe*` 整个目录」收窄到卫士自己的 4 个脚本，放在该目录下的第三方脚本一样会被扫。
+  - 新增 `guard -t`（stdin 逐行判定）与 `guard -P "sh /path/x.sh"`（只预检、不执行、不杀进程），方便回归；两者都会先读配置，保证与正式运行一致。
 - **v1.2.2**：`guard.pid` 被安装器/清理脚本删掉后自动重建（否则外部看门狗和自检会误判"没在跑"）；`service.sh`/`post-fs-data.sh` 改用 `setsid` 启动，脚本退出不再带走主进程；自检脚本修 `printf` 以 `-` 开头格式串的崩溃、并在 pid 文件缺失时按 cmdline 找主进程
 - **v1.2.1**：`MV_DATA` 从「只认三个精确路径」改成「受保护目录的任意子路径」——把受保护目录里的内容 `mv ` 走现在会被拦（往 /data/adb 里搬仍放行，不影响装模块）
 - **v1.2**：新增 stdin / 管道预检（`sh < 文件`、`cat 文件 | sh`、base64 解码链、父进程命令行回溯），新增 `SCAN_STDIN` / `STRICT_PIPE` 配置；命令级规则与块设备监控不变

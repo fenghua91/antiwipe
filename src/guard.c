@@ -66,6 +66,8 @@ static int block_fd_ms = 100;
 static int web_port = 8099;
 static int poweroff_react = 0;   // POWEROFF=1 时才真的关断
 static int safe_uptime = 180;    // 开机这么久之后才认定“这是格机”
+static int rescue_guard = 1;     // 拦「关 SELinux / 关 USB / 断网卡」这类拆救援通道的动作
+static int block_remount = 0;    // 拦「mount -o rw,remount /system」；默认关，很多正常 root 工具也会这么做
 static int poweroff_hold = 0;    // 只冻结不断电（调试）
 static int poweroff_dryrun = 0;  // 断电演练：走完整流程但不真的关机
 static unsigned long fdpass = 0;
@@ -120,6 +122,8 @@ static void load_config(void) {
         else if (!strcmp(k, "POWEROFF_HOLD")) poweroff_hold = atoi(v);
         else if (!strcmp(k, "POWEROFF_DRYRUN")) poweroff_dryrun = atoi(v);
         else if (!strcmp(k, "SAFE_UPTIME")) safe_uptime = atoi(v);
+        else if (!strcmp(k, "RESCUE_GUARD")) rescue_guard = atoi(v);
+        else if (!strcmp(k, "BLOCK_REMOUNT")) block_remount = atoi(v);
         else if (!strcmp(k, "ADMIN_WHITELIST")) { strncpy(whitelist, v, sizeof(whitelist)-1); whitelist[sizeof(whitelist)-1] = 0; }
     }
     fclose(f);
@@ -353,6 +357,21 @@ static void popup(const char *rule, const char *desc, pid_t pid) {
     }
 }
 
+/* v1.3：判断发起者是不是「系统/管理器自己人」。
+ * 系统进程关 USB、重挂分区属于正常行为；脚本干同样的事就是在拆你的救援通道。 */
+static int caller_trusted(pid_t pid) {
+    char p[64], ex[512];
+    snprintf(p, sizeof(p), "/proc/%d/exe", pid);
+    ssize_t n = readlink(p, ex, sizeof(ex) - 1);
+    if (n <= 0) return 0;
+    ex[n] = 0;
+    static const char *ok[] = {"/system", "/vendor", "/apex", "/product", "/odm",
+        "/data/adb/modules/antiwipe", "/data/adb/magisk", "/data/adb/ksu",
+        "/data/adb/ap", "/data/adb/modules_update", NULL};
+    for (int i = 0; ok[i]; i++) if (!strncmp(ex, ok[i], strlen(ok[i]))) return 1;
+    return 0;
+}
+
 static const char *match_cmd(pid_t pid, const char *cmd, char *dbuf, size_t dn) {
     if (strstr(cmd, "sysrq-trigger")) { snprintf(dbuf, dn, "触发内核 sysrq"); return "SYS_REQ"; }
     if (strstr(cmd, "/proc/sys/kernel/panic")) { snprintf(dbuf, dn, "改 panic 参数"); return "PANIC"; }
@@ -485,6 +504,56 @@ static const char *match_cmd(pid_t pid, const char *cmd, char *dbuf, size_t dn) 
                 }
             }
         }
+
+        /* ---- v1.3：拆救援通道 / 降级系统防护 ----
+         * 这些动作单独看都不"格机"，但只要做成了，你就再也没法远程救这台机器：
+         * ADB 断、9008 断、网络断、SELinux 变宽容。历史上大量格机脚本把它们当前置步骤。 */
+        if (rescue_guard && !caller_trusted(pid)) {
+            if (is_tool(t, "setenforce") && at_cmdpos(tok, i)) {
+                for (int j = i + 1; j < nt && j <= i + 2; j++) {
+                    if (is_sep(tok[j])) break;
+                    if (!strcmp(tok[j], "0") || !strcmp(tok[j], "permissive")) {
+                        snprintf(dbuf, dn, "关闭 SELinux"); return "SETENFORCE";
+                    }
+                }
+            }
+            if (is_tool(t, "setprop") && at_cmdpos(tok, i)) {
+                for (int j = i + 1; j < nt && j <= i + 2; j++) {
+                    if (is_sep(tok[j])) break;
+                    if (!strcmp(tok[j], "sys.usb.config") && j + 1 < nt) {
+                        const char *v = tok[j + 1];
+                        if (!strcmp(v, "none") || !strcmp(v, "off") || !strcmp(v, "charging")) {
+                            snprintf(dbuf, dn, "关闭 USB 配置(断 ADB)"); return "USB_KILL";
+                        }
+                    }
+                }
+            }
+            if (is_tool(t, "svc") && i + 1 < nt && !strcmp(tok[i + 1], "usb")) {
+                snprintf(dbuf, dn, "改动 USB 功能"); return "USB_KILL";
+            }
+            if (!strncmp(t, "/sys/class/android_usb/", 23) || !strncmp(t, "/sys/bus/usb/devices/", 21)) {
+                snprintf(dbuf, dn, "直接写 USB 控制器节点"); return "USB_KILL";
+            }
+            if (is_tool(t, "ip") || is_tool(t, "ifconfig")) {
+                for (int j = i + 1; j < nt && j <= i + 8; j++) {
+                    if (is_sep(tok[j])) break;
+                    if (!strcmp(tok[j], "down")) {
+                        snprintf(dbuf, dn, "把网卡置为 down(断网/断远程)"); return "NET_DOWN";
+                    }
+                }
+            }
+        }
+        if (block_remount && !caller_trusted(pid) && is_tool(t, "mount") && at_cmdpos(tok, i)) {
+            int rw = 0, remount = 0;
+            const char *tgt = NULL;
+            for (int j = i + 1; j < nt && j <= i + 12; j++) {
+                if (is_sep(tok[j])) break;
+                if (strstr(tok[j], "remount")) remount = 1;
+                if (!strncmp(tok[j], "rw", 2) || strstr(tok[j], ",rw") || strstr(tok[j], "rw,")) rw = 1;
+                if (tok[j][0] == '/' && !strchr(tok[j], '=')) tgt = tok[j];
+            }
+            if (remount && rw && tgt) { snprintf(dbuf, dn, "把 %s 重挂成可写", tgt); return "MOUNT_RW"; }
+        }
     }
     return NULL;
 }
@@ -552,6 +621,62 @@ static void kill_kids(pid_t p, int depth) {
     }
 }
 
+// ---- v1.3：流式逐行扫描，不再受 1MB 上限；相对路径也解析成绝对路径 ----
+static int is_own_script(const char *p) {
+    const char *names[] = {"/service.sh", "/post-fs-data.sh", "/action.sh", "/uninstall.sh"};
+    size_t ml = strlen(g_moddir);
+    if (strncmp(p, g_moddir, ml)) return 0;
+    for (int i = 0; i < 4; i++) if (!strcmp(p + ml, names[i])) return 1;
+    return 0;
+}
+
+// 流式扫描：吃任何大小的脚本，遇到 NUL 填充直接跳过（有脚本尾部塞十几 MB 零字节）
+static const char *scan_file_stream(pid_t pid, const char *path, char *dbuf, size_t dn) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    const char *hit = NULL;
+    static char line[4096];
+    size_t ln = 0;
+    char *buf = malloc(65536);
+    if (!buf) { fclose(f); return NULL; }
+    unsigned long long total = 0, LIMIT = 64ull << 20;
+    size_t got;
+    while (!hit && (got = fread(buf, 1, 65536, f)) > 0) {
+        total += got;
+        if (total > LIMIT) break;
+        for (size_t i = 0; i < got; i++) {
+            char c = buf[i];
+            if (c == 0) continue;
+            if (c == '\n') {
+                line[ln] = 0;
+                while (ln && (line[ln-1] == '\r' || line[ln-1] == ' ' || line[ln-1] == '\t')) line[--ln] = 0;
+                if (ln) {
+                    char d2[120] = "";
+                    const char *r = match_cmd(pid, line, d2, sizeof(d2));
+                    if (r) { snprintf(dbuf, dn, "脚本预检: %s", d2[0] ? d2 : line); hit = r; break; }
+                }
+                ln = 0;
+            } else if (ln + 1 < sizeof(line)) {
+                line[ln++] = c;
+            }
+        }
+    }
+    if (!hit && ln) {
+        line[ln] = 0;
+        while (ln && (line[ln-1] == '\r' || line[ln-1] == ' ' || line[ln-1] == '\t')) line[--ln] = 0;
+        if (ln) {
+            char d2[120] = "";
+            const char *r = match_cmd(pid, line, d2, sizeof(d2));
+            if (r) { snprintf(dbuf, dn, "脚本预检: %s", d2[0] ? d2 : line); hit = r; }
+        }
+    }
+    free(buf);
+    fclose(f);
+    return hit;
+}
+
 // ---- 脚本静态预检：sh 脚本一 exec 就先读文件，发现危险命令行立刻终止（不等它跑第一条）----
 static const char *precheck_script(pid_t pid, const char *cmd, char *dbuf, size_t dn) {
     if (!scan_scripts) return NULL;
@@ -564,36 +689,22 @@ static const char *precheck_script(pid_t pid, const char *cmd, char *dbuf, size_
         strcmp(b, "dash") && strcmp(b, "ash")) return NULL;
     const char *sp = NULL;
     for (int i = 1; i < nt; i++) { if (tok[i][0] == '-') continue; sp = tok[i]; break; }
-    if (!sp || sp[0] != '/') return NULL;
-    if (!strncmp(sp, "/data/adb/modules/antiwipe", 26) || !strncmp(sp, "/data/adb/antiwipe", 19)) return NULL;
-    struct stat st;
-    if (stat(sp, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return NULL;
-    size_t cap = st.st_size > (1 << 20) ? (1 << 20) : (size_t)st.st_size;
-    FILE *f = fopen(sp, "r");
-    if (!f) return NULL;
-    char *buf = malloc(cap + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t got = fread(buf, 1, cap, f);
-    fclose(f);
-    const char *hit = NULL;
-    char line[1024];
-    size_t pos = 0;
-    while (pos < got) {
-        size_t e = pos;
-        while (e < got && buf[e] != '\n') e++;
-        size_t L = e - pos;
-        if (L >= sizeof(line)) L = sizeof(line) - 1;
-        memcpy(line, buf + pos, L); line[L] = 0;
-        while (L && (line[L-1] == '\r' || line[L-1] == ' ' || line[L-1] == '\t')) line[--L] = 0;
-        if (L > 0) {
-            char d2[120] = "";
-            const char *r = match_cmd(pid, line, d2, sizeof(d2));
-            if (r) { snprintf(dbuf, dn, "脚本预检: %s", d2[0] ? d2 : line); hit = r; break; }
-        }
-        pos = e + 1;
+    if (!sp || !*sp) return NULL;
+    char rp[PATH_MAX * 2];
+    if (sp[0] != '/') {
+        // v1.3：相对路径也预检。旧版这里直接 return NULL，
+        // 于是「cd /sdcard/Download && sh 格机.sh」就绕过了全文扫描。
+        char cwp[64], cw[PATH_MAX];
+        snprintf(cwp, sizeof(cwp), "/proc/%d/cwd", pid);
+        ssize_t cn = readlink(cwp, cw, sizeof(cw) - 1);
+        if (cn <= 0) return NULL;
+        cw[cn] = 0;
+        snprintf(rp, sizeof(rp), "%s/%s", cw, sp);
+    } else {
+        snprintf(rp, sizeof(rp), "%s", sp);
     }
-    free(buf);
-    return hit;
+    if (is_own_script(rp)) return NULL;
+    return scan_file_stream(pid, rp, dbuf, dn);
 }
 
 static void kill_hit(pid_t pid, const char *rule, const char *desc, const char *cmd) {
@@ -685,7 +796,7 @@ static const char *scan_path(pid_t pid, const char *path, char *dbuf, size_t dn,
     if (!path || path[0] != '/') return NULL;
     if (!strncmp(path, "/data/adb/modules/antiwipe", 26) || !strncmp(path, "/data/adb/antiwipe", 19)) return NULL;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return NULL;
-    if (st.st_size > (1 << 20)) return NULL;
+    if (st.st_size > (8 << 20)) return NULL;   // v1.3：1MB 抬到 8MB
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
     char *buf = malloc((size_t)st.st_size + 1);
@@ -1284,6 +1395,16 @@ int main(int argc, char **argv) {
     ssize_t n = readlink(selfpath, selfpath, sizeof(selfpath)-1);
     if (n > 0) selfpath[n] = 0;
     else snprintf(selfpath, sizeof(selfpath), "/data/adb/modules/antiwipe/bin/guard");
+    if (argc > 1 && (argv[1][0] == '-' && (argv[1][1] == 't' || argv[1][1] == 'P')))
+        load_config();   /* 自检模式也读配置，保证判定与正式运行一致 */
+
+    // v1.3 新增：-P "sh /path/x.sh" 只做脚本预检，不执行、不杀进程（自检/回归用）
+    if (argc > 2 && !strcmp(argv[1], "-P")) {
+        char db[160] = "";
+        const char *r = precheck_script(getpid(), argv[2], db, sizeof(db));
+        printf("%s\t%s\n", r ? r : "MISS", db);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "-t")) {
         char line[1024];
         while (fgets(line, sizeof(line), stdin)) {
