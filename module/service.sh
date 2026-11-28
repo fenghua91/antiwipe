@@ -1,11 +1,10 @@
 #!/system/bin/sh
-# 防格机卫士 v1.3.0 · service.sh
 MODDIR=${0%/*}
 RUNDIR=/data/adb/antiwipe
 until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 5; done
 mkdir -p "$RUNDIR/log"
 [ -f "$RUNDIR/config.conf" ] || cp -f "$MODDIR/config.conf" "$RUNDIR/config.conf" 2>/dev/null
-chmod 755 "$MODDIR/bin/guard" "$MODDIR/bin/guard.bak" "$MODDIR/bin/web" "$MODDIR/bin/web.bak" 2>/dev/null
+chmod 755 "$MODDIR/bin/guard" "$MODDIR/bin/web" 2>/dev/null
 
 write_token() {
   [ -f "$RUNDIR/web.token" ] || return 0
@@ -30,7 +29,8 @@ for p in /proc/[0-9]*; do
   esac
 done
 
-# 运行时随机化
+# 运行时随机化：把二进制复制到 /data/adb/antiwipe/run/ 下的随机路径再启动，
+# 这样“按模块目录杀进程”的脚本抓不到正在跑的主进程。
 rm -rf "$RUNDIR/run" 2>/dev/null
 mkdir -p "$RUNDIR/run"
 RUNBIN="$RUNDIR/run/.g$(date +%s)$$"
