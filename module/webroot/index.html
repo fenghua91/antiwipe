@@ -135,7 +135,7 @@ function loadHome(){
     document.getElementById('stats').innerHTML =
       stat('累计拦截', o.total, '次', 'cy') + stat('今天拦截', o.today, '次', o.today > 0 ? 'am' : 'gr') +
       '<div class="stat"><div class="k">已守护</div><div class="v gr" style="font-size:19px">' + dur(o.uptime) + '</div></div>' +
-      '<div class="stat"><div class="k">守护进程</div><div class="v mono ' + (alive ? 'gr' : 'rd') + '" style="font-size:20px">' + o.main + '<span class="u">主</span> ' + o.keeper + '<span class="u">守</span> ' + o.watchdog + '<span class="u">看</span></div></div>';
+      '<div class="stat"><div class="k">守护进程</div><div class="v mono ' + (alive ? 'gr' : 'rd') + '" style="font-size:20px">' + (o.procs || o.main) + '<span class="u">个</span></div></div>';
   });
   api('events.sh?n=6').then(function(list){
     document.getElementById('recent').innerHTML = list.length ? list.map(evHtml).join('') : '<div class="ev"><div class="evd" style="color:#6b7a90">暂无记录</div></div>';

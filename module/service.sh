@@ -17,6 +17,24 @@ write_token() {
 }
 write_token
 
+BB=""
+for b in /data/adb/ksu/bin/busybox /data/adb/magisk/busybox /system/xbin/busybox /system/bin/busybox; do
+  [ -x "$b" ] && { BB=$b; break; }
+done
+start_web() {
+  [ -n "$BB" ] || return 0
+  PORT=$(grep -m1 '^WEB_PORT' "$RUNDIR/config.conf" 2>/dev/null | cut -d= -f2)
+  [ -z "$PORT" ] && PORT=8099
+  [ "$PORT" = "0" ] && return 0
+  for p in /proc/[0-9]*; do
+    c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+    case "$c" in *"httpd -f -p 127.0.0.1:$PORT"*) return 0;; esac
+  done
+  chmod 755 "$MODDIR"/webroot/cgi-bin/api/*.sh 2>/dev/null
+  ( while :; do "$BB" httpd -f -p "127.0.0.1:$PORT" -h "$MODDIR/webroot"; sleep 3; done ) &
+}
+start_web
+
 if ! pm path com.dsh.antiwipe.alerts >/dev/null 2>&1; then
   pm install -r "$MODDIR/alerts.apk" >/dev/null 2>&1
 fi
